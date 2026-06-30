@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/audio",
+    "crates/midi",
+    "crates/dsp",
+    "crates/examples/basic_gain",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+authors = ["crabjuice contributors"]
+

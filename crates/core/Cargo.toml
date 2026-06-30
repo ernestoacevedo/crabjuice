@@ -1,0 +1,13 @@
+[package]
+name = "crabjuice-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core types for crabjuice."
+
+[lib]
+name = "crabjuice_core"
+path = "src/lib.rs"
+
