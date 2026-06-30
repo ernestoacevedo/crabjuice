@@ -1,0 +1,28 @@
+[package]
+name = "real_audio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+cpal = "0.15"
+crabjuice-audio = { path = "../../audio" }
+crabjuice-dsp = { path = "../../dsp" }
+hound = "3.5"
+ringbuf = "0.3"
+
+[lib]
+name = "real_audio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "live_gain"
+path = "src/bin/live_gain.rs"
+
+[[bin]]
+name = "wav_gain"
+path = "src/bin/wav_gain.rs"
