@@ -70,6 +70,17 @@ The command lists input and output devices, defaults to the system devices when
 you press Enter, asks for linear gain, and streams input to output until Enter is
 pressed again. Mono input is duplicated across output channels.
 
+Run the live audio TUI:
+
+```sh
+cargo run -p real_audio --bin live_tui
+```
+
+The TUI lets you select input/output devices, start and stop streaming, restart
+after changing devices, and edit a slot-based DSP chain. The first version
+supports gain and one-pole low-pass slots, with live peak/RMS meters for input
+and output.
+
 ## Example
 
 ```rust
@@ -126,6 +137,7 @@ Run the real-audio examples:
 ```sh
 cargo run -p real_audio --bin wav_gain
 cargo run -p real_audio --bin live_gain
+cargo run -p real_audio --bin live_tui
 ```
 
 ## Current DSP Components

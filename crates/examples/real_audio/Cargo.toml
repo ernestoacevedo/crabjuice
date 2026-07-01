@@ -12,7 +12,9 @@ anyhow = "1"
 cpal = "0.15"
 crabjuice-audio = { path = "../../audio" }
 crabjuice-dsp = { path = "../../dsp" }
+crossterm = "0.27"
 hound = "3.5"
+ratatui = "0.26"
 ringbuf = "0.3"
 
 [lib]
@@ -22,6 +24,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "live_gain"
 path = "src/bin/live_gain.rs"
+
+[[bin]]
+name = "live_tui"
+path = "src/bin/live_tui.rs"
 
 [[bin]]
 name = "wav_gain"
