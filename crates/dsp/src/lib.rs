@@ -52,6 +52,185 @@ impl AudioProcessor for GainProcessor {
     fn reset(&mut self) {}
 }
 
+/// Feedback delay processor with dry/wet mix.
+#[derive(Debug, Clone)]
+pub struct DelayProcessor {
+    sample_rate: f32,
+    delay_ms: f32,
+    feedback: f32,
+    mix: f32,
+    lines: Vec<DelayLine>,
+}
+
+impl DelayProcessor {
+    const MAX_DELAY_SECONDS: f32 = 2.0;
+
+    /// Creates a delay processor.
+    pub fn new(delay_ms: f32, feedback: f32, mix: f32) -> Self {
+        let mut processor = Self {
+            sample_rate: 44_100.0,
+            delay_ms: delay_ms.clamp(0.0, Self::MAX_DELAY_SECONDS * 1_000.0),
+            feedback: feedback.clamp(0.0, 0.95),
+            mix: mix.clamp(0.0, 1.0),
+            lines: Vec::new(),
+        };
+        processor.update_delay_samples();
+        processor
+    }
+
+    /// Sets the delay time in milliseconds.
+    pub fn set_delay_ms(&mut self, delay_ms: f32) {
+        self.delay_ms = delay_ms.clamp(0.0, Self::MAX_DELAY_SECONDS * 1_000.0);
+        self.update_delay_samples();
+    }
+
+    /// Returns the delay time in milliseconds.
+    pub fn delay_ms(&self) -> f32 {
+        self.delay_ms
+    }
+
+    /// Sets feedback amount in `0.0..=0.95`.
+    pub fn set_feedback(&mut self, feedback: f32) {
+        self.feedback = feedback.clamp(0.0, 0.95);
+    }
+
+    /// Returns feedback amount.
+    pub fn feedback(&self) -> f32 {
+        self.feedback
+    }
+
+    /// Sets wet mix in `0.0..=1.0`.
+    pub fn set_mix(&mut self, mix: f32) {
+        self.mix = mix.clamp(0.0, 1.0);
+    }
+
+    /// Returns wet mix.
+    pub fn mix(&self) -> f32 {
+        self.mix
+    }
+
+    fn max_delay_samples(&self) -> usize {
+        (self.sample_rate * Self::MAX_DELAY_SECONDS).round() as usize
+    }
+
+    fn delay_samples(&self) -> usize {
+        ((self.delay_ms / 1_000.0) * self.sample_rate).round() as usize
+    }
+
+    fn update_delay_samples(&mut self) {
+        let delay_samples = self.delay_samples();
+        for line in &mut self.lines {
+            line.set_delay_samples(delay_samples);
+        }
+    }
+}
+
+impl Default for DelayProcessor {
+    fn default() -> Self {
+        Self::new(250.0, 0.25, 0.35)
+    }
+}
+
+impl AudioProcessor for DelayProcessor {
+    fn prepare(&mut self, sample_rate: f32, _max_block_size: usize) {
+        self.sample_rate = sample_rate.max(1.0);
+        let max_delay_samples = self.max_delay_samples();
+        for line in &mut self.lines {
+            if line.max_delay_samples() != max_delay_samples {
+                *line = DelayLine::new(max_delay_samples);
+            }
+        }
+        self.update_delay_samples();
+    }
+
+    fn process(&mut self, ctx: &mut ProcessContext<'_>) {
+        let channels = ctx.buffer.num_channels();
+        let max_delay_samples = self.max_delay_samples();
+        self.lines
+            .resize_with(channels, || DelayLine::new(max_delay_samples));
+        self.update_delay_samples();
+
+        for (channel_index, channel) in ctx.buffer.channels_mut().enumerate() {
+            let line = &mut self.lines[channel_index];
+            for sample in channel {
+                let input = *sample;
+                let delayed = line.process_sample_with_feedback(input, self.feedback);
+                *sample = input * (1.0 - self.mix) + delayed * self.mix;
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        for line in &mut self.lines {
+            line.reset();
+        }
+    }
+}
+
+/// Soft-clipping distortion processor.
+#[derive(Debug, Clone)]
+pub struct DistortionProcessor {
+    drive: f32,
+    mix: f32,
+}
+
+impl DistortionProcessor {
+    /// Creates a distortion processor.
+    pub fn new(drive: f32, mix: f32) -> Self {
+        Self {
+            drive: drive.clamp(1.0, 20.0),
+            mix: mix.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Sets pre-clip drive in `1.0..=20.0`.
+    pub fn set_drive(&mut self, drive: f32) {
+        self.drive = drive.clamp(1.0, 20.0);
+    }
+
+    /// Returns pre-clip drive.
+    pub fn drive(&self) -> f32 {
+        self.drive
+    }
+
+    /// Sets wet mix in `0.0..=1.0`.
+    pub fn set_mix(&mut self, mix: f32) {
+        self.mix = mix.clamp(0.0, 1.0);
+    }
+
+    /// Returns wet mix.
+    pub fn mix(&self) -> f32 {
+        self.mix
+    }
+
+    /// Processes one sample.
+    pub fn process_sample(&self, input: f32) -> f32 {
+        let normalizer = self.drive.tanh().max(f32::EPSILON);
+        let wet = (input * self.drive).tanh() / normalizer;
+        input * (1.0 - self.mix) + wet * self.mix
+    }
+}
+
+impl Default for DistortionProcessor {
+    fn default() -> Self {
+        Self::new(3.0, 1.0)
+    }
+}
+
+impl AudioProcessor for DistortionProcessor {
+    fn prepare(&mut self, _sample_rate: f32, _max_block_size: usize) {}
+
+    fn process(&mut self, ctx: &mut ProcessContext<'_>) {
+        for channel in ctx.buffer.channels_mut() {
+            for sample in channel {
+                *sample = self.process_sample(*sample);
+            }
+        }
+    }
+
+    fn reset(&mut self) {}
+}
+
 /// Fixed-capacity circular delay line for `f32` samples.
 #[derive(Debug, Clone)]
 pub struct DelayLine {
@@ -87,6 +266,16 @@ impl DelayLine {
             (self.write_pos + self.buffer.len() - self.delay_samples) % self.buffer.len();
         let output = self.buffer[read_pos];
         self.buffer[self.write_pos] = input;
+        self.write_pos = (self.write_pos + 1) % self.buffer.len();
+        output
+    }
+
+    /// Pushes one sample plus delayed feedback and returns the delayed output.
+    pub fn process_sample_with_feedback(&mut self, input: f32, feedback: f32) -> f32 {
+        let read_pos =
+            (self.write_pos + self.buffer.len() - self.delay_samples) % self.buffer.len();
+        let output = self.buffer[read_pos];
+        self.buffer[self.write_pos] = input + output * feedback.clamp(0.0, 0.95);
         self.write_pos = (self.write_pos + 1) % self.buffer.len();
         output
     }
@@ -274,6 +463,52 @@ mod tests {
 
         delay.reset();
         assert_eq!(delay.process_sample(5.0), 0.0);
+    }
+
+    #[test]
+    fn delay_line_applies_feedback() {
+        let mut delay = DelayLine::new(1);
+        delay.set_delay_samples(1);
+
+        assert_eq!(delay.process_sample_with_feedback(1.0, 0.5), 0.0);
+        assert_eq!(delay.process_sample_with_feedback(0.0, 0.5), 1.0);
+        assert_eq!(delay.process_sample_with_feedback(0.0, 0.5), 0.5);
+    }
+
+    #[test]
+    fn delay_processor_outputs_delayed_signal() {
+        let mut buffer = AudioBuffer::new(1, 4);
+        buffer
+            .channel_mut(0)
+            .expect("channel exists")
+            .copy_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+
+        let mut delay = DelayProcessor::new(2.0, 0.0, 1.0);
+        delay.prepare(1_000.0, 4);
+        process(&mut delay, &mut buffer);
+
+        assert_eq!(
+            buffer.channel(0).expect("channel exists"),
+            &[0.0, 0.0, 1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn distortion_processor_soft_clips_symmetrically() {
+        let mut buffer = AudioBuffer::new(1, 3);
+        buffer
+            .channel_mut(0)
+            .expect("channel exists")
+            .copy_from_slice(&[-0.5, 0.0, 0.5]);
+
+        let mut distortion = DistortionProcessor::new(4.0, 1.0);
+        process(&mut distortion, &mut buffer);
+
+        let channel = buffer.channel(0).expect("channel exists");
+        assert!(channel[0] < -0.5);
+        assert_eq!(channel[1], 0.0);
+        assert!(channel[2] > 0.5);
+        assert!((channel[0] + channel[2]).abs() < f32::EPSILON);
     }
 
     #[test]

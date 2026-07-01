@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use cpal::Host;
 use crabjuice_audio::{AudioProcessor, ProcessContext};
-use crabjuice_dsp::{GainProcessor, OnePoleLowPass};
+use crabjuice_dsp::{DelayProcessor, DistortionProcessor, GainProcessor, OnePoleLowPass};
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -125,6 +125,7 @@ struct App {
     selected_input: usize,
     selected_output: usize,
     selected_slot: usize,
+    selected_param: usize,
     active_panel: Panel,
     slots: Vec<ProcessorSlot>,
     processor: SharedProcessor,
@@ -148,6 +149,7 @@ impl App {
             selected_input,
             selected_output,
             selected_slot: 0,
+            selected_param: 0,
             active_panel: Panel::Input,
             slots,
             processor,
@@ -167,6 +169,8 @@ impl App {
             KeyCode::Char('d') => self.toggle_slot(),
             KeyCode::Char('x') => self.delete_slot(),
             KeyCode::Char('t') => self.toggle_slot_kind(),
+            KeyCode::Char('[') => self.move_param(-1),
+            KeyCode::Char(']') => self.move_param(1),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Left => self.adjust_active_param(-1.0),
@@ -256,9 +260,20 @@ impl App {
         if let Some(slot) = self.slots.get_mut(self.selected_slot) {
             slot.kind = match slot.kind {
                 ProcessorKind::Gain => ProcessorKind::LowPass,
-                ProcessorKind::LowPass => ProcessorKind::Gain,
+                ProcessorKind::LowPass => ProcessorKind::Delay,
+                ProcessorKind::Delay => ProcessorKind::Distortion,
+                ProcessorKind::Distortion => ProcessorKind::Gain,
             };
+            self.selected_param = self
+                .selected_param
+                .min(slot.param_count().saturating_sub(1));
             self.rebuild_processor();
+        }
+    }
+
+    fn move_param(&mut self, delta: isize) {
+        if let Some(slot) = self.slots.get(self.selected_slot) {
+            self.selected_param = moved_index(self.selected_param, slot.param_count(), delta);
         }
     }
 
@@ -274,6 +289,7 @@ impl App {
             }
             Panel::Chain | Panel::Params => {
                 self.selected_slot = moved_index(self.selected_slot, self.slots.len(), delta);
+                self.selected_param = 0;
             }
         }
     }
@@ -284,19 +300,7 @@ impl App {
         }
 
         if let Some(slot) = self.slots.get_mut(self.selected_slot) {
-            match slot.kind {
-                ProcessorKind::Gain => {
-                    slot.gain = (slot.gain + direction * 0.05).clamp(0.0, 4.0);
-                }
-                ProcessorKind::LowPass => {
-                    let step = if slot.cutoff_hz < 1_000.0 {
-                        25.0
-                    } else {
-                        250.0
-                    };
-                    slot.cutoff_hz = (slot.cutoff_hz + direction * step).clamp(20.0, 20_000.0);
-                }
-            }
+            slot.adjust_param(self.selected_param, direction);
             self.rebuild_processor();
         }
     }
@@ -352,6 +356,8 @@ fn moved_index(current: usize, len: usize, delta: isize) -> usize {
 enum ProcessorKind {
     Gain,
     LowPass,
+    Delay,
+    Distortion,
 }
 
 impl ProcessorKind {
@@ -359,6 +365,8 @@ impl ProcessorKind {
         match self {
             Self::Gain => "Gain",
             Self::LowPass => "LowPass",
+            Self::Delay => "Delay",
+            Self::Distortion => "Distort",
         }
     }
 }
@@ -369,6 +377,10 @@ struct ProcessorSlot {
     enabled: bool,
     gain: f32,
     cutoff_hz: f32,
+    delay_ms: f32,
+    feedback: f32,
+    mix: f32,
+    drive: f32,
 }
 
 impl ProcessorSlot {
@@ -378,6 +390,44 @@ impl ProcessorSlot {
             enabled: true,
             gain: 1.0,
             cutoff_hz: 2_000.0,
+            delay_ms: 250.0,
+            feedback: 0.25,
+            mix: 0.35,
+            drive: 3.0,
+        }
+    }
+
+    fn param_count(&self) -> usize {
+        match self.kind {
+            ProcessorKind::Gain => 1,
+            ProcessorKind::LowPass => 1,
+            ProcessorKind::Delay => 3,
+            ProcessorKind::Distortion => 2,
+        }
+    }
+
+    fn adjust_param(&mut self, param: usize, direction: f32) {
+        match self.kind {
+            ProcessorKind::Gain => {
+                self.gain = (self.gain + direction * 0.05).clamp(0.0, 4.0);
+            }
+            ProcessorKind::LowPass => {
+                let step = if self.cutoff_hz < 1_000.0 {
+                    25.0
+                } else {
+                    250.0
+                };
+                self.cutoff_hz = (self.cutoff_hz + direction * step).clamp(20.0, 20_000.0);
+            }
+            ProcessorKind::Delay => match param {
+                0 => self.delay_ms = (self.delay_ms + direction * 10.0).clamp(0.0, 2_000.0),
+                1 => self.feedback = (self.feedback + direction * 0.025).clamp(0.0, 0.95),
+                _ => self.mix = (self.mix + direction * 0.025).clamp(0.0, 1.0),
+            },
+            ProcessorKind::Distortion => match param {
+                0 => self.drive = (self.drive + direction * 0.25).clamp(1.0, 20.0),
+                _ => self.mix = (self.mix + direction * 0.025).clamp(0.0, 1.0),
+            },
         }
     }
 }
@@ -399,6 +449,14 @@ impl LiveChain {
                     }
                     ProcessorKind::LowPass => {
                         ProcessorNode::LowPass(OnePoleLowPass::new(slot.cutoff_hz))
+                    }
+                    ProcessorKind::Delay => ProcessorNode::Delay(DelayProcessor::new(
+                        slot.delay_ms,
+                        slot.feedback,
+                        slot.mix,
+                    )),
+                    ProcessorKind::Distortion => {
+                        ProcessorNode::Distortion(DistortionProcessor::new(slot.drive, slot.mix))
                     }
                 };
                 (slot.enabled, node)
@@ -436,6 +494,8 @@ impl AudioProcessor for LiveChain {
 enum ProcessorNode {
     Gain(GainProcessor),
     LowPass(OnePoleLowPass),
+    Delay(DelayProcessor),
+    Distortion(DistortionProcessor),
 }
 
 impl AudioProcessor for ProcessorNode {
@@ -443,6 +503,8 @@ impl AudioProcessor for ProcessorNode {
         match self {
             Self::Gain(processor) => processor.prepare(sample_rate, max_block_size),
             Self::LowPass(processor) => processor.prepare(sample_rate, max_block_size),
+            Self::Delay(processor) => processor.prepare(sample_rate, max_block_size),
+            Self::Distortion(processor) => processor.prepare(sample_rate, max_block_size),
         }
     }
 
@@ -450,6 +512,8 @@ impl AudioProcessor for ProcessorNode {
         match self {
             Self::Gain(processor) => processor.process(ctx),
             Self::LowPass(processor) => processor.process(ctx),
+            Self::Delay(processor) => processor.process(ctx),
+            Self::Distortion(processor) => processor.process(ctx),
         }
     }
 
@@ -457,6 +521,8 @@ impl AudioProcessor for ProcessorNode {
         match self {
             Self::Gain(processor) => processor.reset(),
             Self::LowPass(processor) => processor.reset(),
+            Self::Delay(processor) => processor.reset(),
+            Self::Distortion(processor) => processor.reset(),
         }
     }
 }
@@ -588,19 +654,19 @@ fn draw_chain(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_params(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = if let Some(slot) = app.slots.get(app.selected_slot) {
-        vec![
-            Line::from(vec![
-                Span::styled("Type: ", Style::default().fg(Color::Gray)),
-                Span::raw(slot.kind.label()),
-                Span::raw("  "),
-                Span::styled("Enabled: ", Style::default().fg(Color::Gray)),
-                Span::raw(if slot.enabled { "yes" } else { "no" }),
-            ]),
-            Line::from(format!("Gain: {:.2}", slot.gain)),
-            Line::from(format!("Cutoff: {:.0} Hz", slot.cutoff_hz)),
-            Line::from("Left/Right adjusts the active processor parameter."),
-            Line::from("t switches slot type."),
-        ]
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Type: ", Style::default().fg(Color::Gray)),
+            Span::raw(slot.kind.label()),
+            Span::raw("  "),
+            Span::styled("Enabled: ", Style::default().fg(Color::Gray)),
+            Span::raw(if slot.enabled { "yes" } else { "no" }),
+        ])];
+        lines.extend(param_lines(slot, app.selected_param));
+        lines.extend([
+            Line::from("Left/Right adjusts selected parameter."),
+            Line::from("[/] selects parameter, t switches slot type."),
+        ]);
+        lines
     } else {
         vec![Line::from("No selected slot.")]
     };
@@ -610,6 +676,41 @@ fn draw_params(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn param_lines(slot: &ProcessorSlot, selected_param: usize) -> Vec<Line<'static>> {
+    match slot.kind {
+        ProcessorKind::Gain => vec![param_line(
+            0,
+            selected_param,
+            format!("Gain: {:.2}", slot.gain),
+        )],
+        ProcessorKind::LowPass => vec![param_line(
+            0,
+            selected_param,
+            format!("Cutoff: {:.0} Hz", slot.cutoff_hz),
+        )],
+        ProcessorKind::Delay => vec![
+            param_line(0, selected_param, format!("Delay: {:.0} ms", slot.delay_ms)),
+            param_line(1, selected_param, format!("Feedback: {:.2}", slot.feedback)),
+            param_line(2, selected_param, format!("Mix: {:.2}", slot.mix)),
+        ],
+        ProcessorKind::Distortion => vec![
+            param_line(0, selected_param, format!("Drive: {:.2}", slot.drive)),
+            param_line(1, selected_param, format!("Mix: {:.2}", slot.mix)),
+        ],
+    }
+}
+
+fn param_line(index: usize, selected_param: usize, text: String) -> Line<'static> {
+    if index == selected_param {
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(text, Style::default().add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        Line::from(format!("  {text}"))
+    }
 }
 
 fn draw_meters(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -634,7 +735,7 @@ fn render_meter(frame: &mut Frame<'_>, area: Rect, title: &str, stats: AudioStat
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let text = "Tab panels | Space start/stop | Enter apply device | r restart | a add | t type | d enable | x delete | arrows navigate/adjust | q quit";
+    let text = "Tab panels | Space start/stop | Enter apply device | r restart | a add | t type | d enable | x delete | [/] param | arrows navigate/adjust | q quit";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL))
@@ -676,13 +777,13 @@ mod tests {
                 kind: ProcessorKind::Gain,
                 enabled: true,
                 gain: 0.5,
-                cutoff_hz: 2_000.0,
+                ..ProcessorSlot::gain()
             },
             ProcessorSlot {
                 kind: ProcessorKind::Gain,
                 enabled: false,
                 gain: 0.0,
-                cutoff_hz: 2_000.0,
+                ..ProcessorSlot::gain()
             },
         ];
         let chain = LiveChain::from_slots(&slots);

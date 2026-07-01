@@ -77,9 +77,9 @@ cargo run -p real_audio --bin live_tui
 ```
 
 The TUI lets you select input/output devices, start and stop streaming, restart
-after changing devices, and edit a slot-based DSP chain. The first version
-supports gain and one-pole low-pass slots, with live peak/RMS meters for input
-and output.
+after changing devices, and edit a slot-based DSP chain. It supports gain,
+one-pole low-pass, delay, and soft-clipping distortion slots, with live peak/RMS
+meters for input and output.
 
 ## Example
 
@@ -145,6 +145,8 @@ cargo run -p real_audio --bin live_tui
 - `GainProcessor`: multiplies every sample by a linear gain value in
   `0.0..=4.0`.
 - `DelayLine`: fixed-capacity circular delay line for `f32` samples.
+- `DelayProcessor`: feedback delay with delay time, feedback, and dry/wet mix.
+- `DistortionProcessor`: normalized soft-clipping distortion with drive and mix.
 - `ProcessorChain`: sequential container for boxed `AudioProcessor`
   implementations.
 - `OnePoleLowPass`: simple one-pole low-pass filter with per-channel state.
