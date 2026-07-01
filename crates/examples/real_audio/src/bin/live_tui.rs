@@ -45,6 +45,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         }
     }
 
+    app.stop_stream();
     Ok(())
 }
 
@@ -184,8 +185,7 @@ impl App {
 
     fn toggle_stream(&mut self) -> Result<()> {
         if self.session.is_some() {
-            self.session = None;
-            self.status = "Stopped".to_string();
+            self.stop_stream();
             return Ok(());
         }
 
@@ -210,7 +210,7 @@ impl App {
 
     fn restart_stream(&mut self) -> Result<()> {
         let was_running = self.session.is_some();
-        self.session = None;
+        self.stop_stream();
         if was_running {
             self.start_stream()?;
             self.status = "Restarted".to_string();
@@ -219,6 +219,16 @@ impl App {
             self.status = "Ready".to_string();
         }
         Ok(())
+    }
+
+    fn stop_stream(&mut self) {
+        if let Some(session) = self.session.take() {
+            if let Err(error) = session.stop() {
+                self.status = format!("Stop failed: {error}");
+                return;
+            }
+        }
+        self.status = "Stopped".to_string();
     }
 
     fn activate_selection(&mut self) -> Result<()> {

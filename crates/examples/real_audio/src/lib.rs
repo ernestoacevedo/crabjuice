@@ -49,12 +49,29 @@ impl LiveAudioSession {
         Ok(())
     }
 
+    pub fn stop(&self) -> Result<()> {
+        self.input_stream
+            .pause()
+            .context("failed to pause input stream")?;
+        self.output_stream
+            .pause()
+            .context("failed to pause output stream")?;
+        Ok(())
+    }
+
     pub fn input_stats(&self) -> AudioStats {
         current_stats(&self.input_stats)
     }
 
     pub fn output_stats(&self) -> AudioStats {
         current_stats(&self.output_stats)
+    }
+}
+
+impl Drop for LiveAudioSession {
+    fn drop(&mut self) {
+        let _ = self.input_stream.pause();
+        let _ = self.output_stream.pause();
     }
 }
 
