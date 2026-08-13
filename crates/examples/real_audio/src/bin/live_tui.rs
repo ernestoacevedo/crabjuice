@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use cpal::Host;
 use crabjuice_audio::{AudioProcessor, ProcessContext};
 use crabjuice_dsp::{DelayProcessor, DistortionProcessor, GainProcessor, OnePoleLowPass};
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -37,10 +40,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         terminal.draw(|frame| draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if app.handle_key(key)? {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    if app.handle_key(key)? {
+                        break;
+                    }
                 }
+                Event::Mouse(mouse) => app.handle_mouse(mouse, terminal.size()?)?,
+                _ => {}
             }
         }
     }
@@ -58,7 +65,8 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+            .context("failed to enter alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).context("failed to create terminal")?;
         Ok(Self {
@@ -74,8 +82,12 @@ impl TerminalGuard {
     fn leave(&mut self) -> Result<()> {
         if self.active {
             disable_raw_mode().context("failed to disable raw mode")?;
-            execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
-                .context("failed to leave alternate screen")?;
+            execute!(
+                self.terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )
+            .context("failed to leave alternate screen")?;
             self.terminal
                 .show_cursor()
                 .context("failed to show cursor")?;
@@ -119,6 +131,47 @@ impl Panel {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AppLayout {
+    input: Rect,
+    output: Rect,
+    chain: Rect,
+    params: Rect,
+}
+
+impl AppLayout {
+    fn new(area: Rect) -> Self {
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(5),
+                Constraint::Length(3),
+            ])
+            .split(area);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .split(root[1]);
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(columns[2]);
+
+        Self {
+            input: columns[0],
+            output: columns[1],
+            chain: right[0],
+            params: right[1],
+        }
+    }
+}
+
 struct App {
     host: Host,
     input_devices: Vec<DeviceInfo>,
@@ -132,6 +185,7 @@ struct App {
     processor: SharedProcessor,
     session: Option<LiveAudioSession>,
     status: String,
+    last_drag_col: Option<u16>,
 }
 
 impl App {
@@ -156,6 +210,7 @@ impl App {
             processor,
             session: None,
             status: "Stopped".to_string(),
+            last_drag_col: None,
         })
     }
 
@@ -183,6 +238,86 @@ impl App {
         Ok(false)
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent, terminal_area: Rect) -> Result<()> {
+        let layout = AppLayout::new(terminal_area);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.last_drag_col = Some(mouse.column);
+                self.click_at(mouse.column, mouse.row, layout)?;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.drag_param_at(mouse.column, mouse.row, layout);
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.last_drag_col = None,
+            MouseEventKind::ScrollUp => self.scroll_at(mouse.column, mouse.row, -1, layout),
+            MouseEventKind::ScrollDown => self.scroll_at(mouse.column, mouse.row, 1, layout),
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn click_at(&mut self, column: u16, row: u16, layout: AppLayout) -> Result<()> {
+        if let Some(index) = list_index_at(layout.input, column, row, self.input_devices.len()) {
+            self.active_panel = Panel::Input;
+            self.selected_input = index;
+        } else if let Some(index) =
+            list_index_at(layout.output, column, row, self.output_devices.len())
+        {
+            self.active_panel = Panel::Output;
+            self.selected_output = index;
+        } else if let Some(index) = list_index_at(layout.chain, column, row, self.slots.len()) {
+            self.active_panel = Panel::Chain;
+            self.selected_slot = index;
+            self.selected_param = 0;
+        } else if rect_contains(layout.params, column, row) {
+            self.active_panel = Panel::Params;
+            if let Some(index) = param_index_at(layout.params, row, self.selected_slot()) {
+                self.selected_param = index;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn drag_param_at(&mut self, column: u16, row: u16, layout: AppLayout) {
+        if !rect_contains(layout.params, column, row) {
+            return;
+        }
+
+        self.active_panel = Panel::Params;
+        let Some(previous) = self.last_drag_col else {
+            self.last_drag_col = Some(column);
+            return;
+        };
+        let delta = i32::from(column) - i32::from(previous);
+        if delta.abs() >= 2 {
+            self.adjust_active_param(delta.signum() as f32);
+            self.last_drag_col = Some(column);
+        }
+    }
+
+    fn scroll_at(&mut self, column: u16, row: u16, delta: isize, layout: AppLayout) {
+        if rect_contains(layout.input, column, row) {
+            self.active_panel = Panel::Input;
+            self.move_selection(delta);
+        } else if rect_contains(layout.output, column, row) {
+            self.active_panel = Panel::Output;
+            self.move_selection(delta);
+        } else if rect_contains(layout.chain, column, row) {
+            self.active_panel = Panel::Chain;
+            self.move_selection(delta);
+        } else if rect_contains(layout.params, column, row) {
+            self.active_panel = Panel::Params;
+            let direction = if delta.is_negative() { 1.0 } else { -1.0 };
+            self.adjust_active_param(direction);
+        }
+    }
+
+    fn selected_slot(&self) -> Option<&ProcessorSlot> {
+        self.slots.get(self.selected_slot)
+    }
     fn toggle_stream(&mut self) -> Result<()> {
         if self.session.is_some() {
             self.stop_stream();
@@ -360,6 +495,45 @@ fn moved_index(current: usize, len: usize, delta: isize) -> usize {
     } else {
         current.saturating_add(delta as usize).min(last)
     }
+}
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    let right = u32::from(area.x) + u32::from(area.width);
+    let bottom = u32::from(area.y) + u32::from(area.height);
+    u32::from(column) >= u32::from(area.x)
+        && u32::from(column) < right
+        && u32::from(row) >= u32::from(area.y)
+        && u32::from(row) < bottom
+}
+
+fn inner_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn list_index_at(area: Rect, column: u16, row: u16, len: usize) -> Option<usize> {
+    let area = inner_area(area);
+    if len == 0 || !rect_contains(area, column, row) {
+        return None;
+    }
+
+    let index = usize::from(row.saturating_sub(area.y));
+    (index < len).then_some(index)
+}
+
+fn param_index_at(area: Rect, row: u16, slot: Option<&ProcessorSlot>) -> Option<usize> {
+    let slot = slot?;
+    let content = inner_area(area);
+    let first_param_row = content.y.saturating_add(1);
+    if row < first_param_row {
+        return None;
+    }
+
+    let index = usize::from(row - first_param_row);
+    (index < slot.param_count()).then_some(index)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,7 +919,7 @@ fn render_meter(frame: &mut Frame<'_>, area: Rect, title: &str, stats: AudioStat
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let text = "Tab panels | Space start/stop | Enter apply device | r restart | a add | t type | d enable | x delete | [/] param | arrows navigate/adjust | q quit";
+    let text = "Tab panels | Space start/stop | Enter apply | mouse click selects | wheel navigates/adjusts | drag params | arrows adjust | q quit";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL))
