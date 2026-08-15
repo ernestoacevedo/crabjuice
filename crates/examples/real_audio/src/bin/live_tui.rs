@@ -3,8 +3,8 @@ use cpal::Host;
 use crabjuice_audio::{AudioProcessor, ProcessContext};
 use crabjuice_dsp::{DelayProcessor, DistortionProcessor, GainProcessor, OnePoleLowPass};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton,
-    MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -14,7 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use real_audio::{
     default_input_index, default_output_index, input_devices, output_devices, select_input_device,
@@ -133,10 +133,13 @@ impl Panel {
 
 #[derive(Debug, Clone, Copy)]
 struct AppLayout {
+    status: Rect,
     input: Rect,
     output: Rect,
     chain: Rect,
     params: Rect,
+    meters: Rect,
+    help: Rect,
 }
 
 impl AppLayout {
@@ -145,30 +148,57 @@ impl AppLayout {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
+                Constraint::Length(5),
                 Constraint::Min(10),
                 Constraint::Length(5),
                 Constraint::Length(3),
             ])
             .split(area);
-        let columns = Layout::default()
+        let devices = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-            ])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(root[1]);
-        let right = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(columns[2]);
+        let workspace = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(root[2]);
 
         Self {
-            input: columns[0],
-            output: columns[1],
-            chain: right[0],
-            params: right[1],
+            status: root[0],
+            input: devices[0],
+            output: devices[1],
+            chain: workspace[0],
+            params: workspace[1],
+            meters: root[3],
+            help: root[4],
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParamDrag {
+    slot: usize,
+    param: usize,
+    slider: Rect,
+    start_col: u16,
+    start_ratio: f32,
+}
+
+impl ParamDrag {
+    fn updated(mut self, column: u16, fine: bool) -> (f32, Self) {
+        let ratio = if fine {
+            let delta = i32::from(column) - i32::from(self.start_col);
+            self.start_ratio + delta as f32 * 0.005
+        } else {
+            slider_ratio_at(self.slider, column)
+        }
+        .clamp(0.0, 1.0);
+
+        if !fine {
+            self.start_col = column;
+            self.start_ratio = ratio;
+        }
+        (ratio, self)
     }
 }
 
@@ -185,7 +215,8 @@ struct App {
     processor: SharedProcessor,
     session: Option<LiveAudioSession>,
     status: String,
-    last_drag_col: Option<u16>,
+    effect_picker: Option<usize>,
+    param_drag: Option<ParamDrag>,
 }
 
 impl App {
@@ -210,18 +241,24 @@ impl App {
             processor,
             session: None,
             status: "Stopped".to_string(),
-            last_drag_col: None,
+            effect_picker: None,
+            param_drag: None,
         })
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.effect_picker.is_some() {
+            self.handle_effect_picker_key(key);
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Tab => self.active_panel = self.active_panel.next(),
             KeyCode::BackTab => self.active_panel = self.active_panel.previous(),
             KeyCode::Char(' ') => self.toggle_stream()?,
             KeyCode::Char('r') => self.restart_stream()?,
-            KeyCode::Char('a') => self.add_slot(),
+            KeyCode::Char('a') => self.effect_picker = Some(0),
             KeyCode::Char('d') => self.toggle_slot(),
             KeyCode::Char('x') => self.delete_slot(),
             KeyCode::Char('t') => self.toggle_slot_kind(),
@@ -229,8 +266,8 @@ impl App {
             KeyCode::Char(']') => self.move_param(1),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
-            KeyCode::Left => self.adjust_active_param(-1.0),
-            KeyCode::Right => self.adjust_active_param(1.0),
+            KeyCode::Left => self.adjust_active_param(-key_adjustment(key.modifiers)),
+            KeyCode::Right => self.adjust_active_param(key_adjustment(key.modifiers)),
             KeyCode::Enter => self.activate_selection()?,
             _ => {}
         }
@@ -241,17 +278,44 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent, terminal_area: Rect) -> Result<()> {
         let layout = AppLayout::new(terminal_area);
 
+        if self.effect_picker.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let picker = effect_picker_area(terminal_area);
+                if let Some(kind) = effect_kind_at(picker, mouse.column, mouse.row) {
+                    self.add_slot(kind);
+                    self.effect_picker = None;
+                } else if !rect_contains(picker, mouse.column, mouse.row) {
+                    self.effect_picker = None;
+                }
+            }
+            return Ok(());
+        }
+
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                self.last_drag_col = Some(mouse.column);
-                self.click_at(mouse.column, mouse.row, layout)?;
+                self.param_drag = None;
+                if !self.begin_param_drag(mouse, layout) {
+                    self.click_at(mouse.column, mouse.row, layout)?;
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                self.drag_param_at(mouse.column, mouse.row, layout);
+                self.drag_param_at(mouse);
             }
-            MouseEventKind::Up(MouseButton::Left) => self.last_drag_col = None,
-            MouseEventKind::ScrollUp => self.scroll_at(mouse.column, mouse.row, -1, layout),
-            MouseEventKind::ScrollDown => self.scroll_at(mouse.column, mouse.row, 1, layout),
+            MouseEventKind::Up(MouseButton::Left) => self.param_drag = None,
+            MouseEventKind::ScrollUp => self.scroll_at(
+                mouse.column,
+                mouse.row,
+                -1,
+                layout,
+                mouse.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            MouseEventKind::ScrollDown => self.scroll_at(
+                mouse.column,
+                mouse.row,
+                1,
+                layout,
+                mouse.modifiers.contains(KeyModifiers::SHIFT),
+            ),
             _ => {}
         }
 
@@ -259,18 +323,32 @@ impl App {
     }
 
     fn click_at(&mut self, column: u16, row: u16, layout: AppLayout) -> Result<()> {
-        if let Some(index) = list_index_at(layout.input, column, row, self.input_devices.len()) {
+        if let Some(index) = visible_list_index_at(
+            layout.input,
+            column,
+            row,
+            self.input_devices.len(),
+            self.selected_input,
+        ) {
             self.active_panel = Panel::Input;
             self.selected_input = index;
-        } else if let Some(index) =
-            list_index_at(layout.output, column, row, self.output_devices.len())
-        {
+        } else if let Some(index) = visible_list_index_at(
+            layout.output,
+            column,
+            row,
+            self.output_devices.len(),
+            self.selected_output,
+        ) {
             self.active_panel = Panel::Output;
             self.selected_output = index;
-        } else if let Some(index) = list_index_at(layout.chain, column, row, self.slots.len()) {
-            self.active_panel = Panel::Chain;
-            self.selected_slot = index;
-            self.selected_param = 0;
+        } else if let Some(action) = chain_action_at(
+            layout.chain,
+            column,
+            row,
+            self.slots.len(),
+            self.selected_slot,
+        ) {
+            self.handle_chain_action(action);
         } else if rect_contains(layout.params, column, row) {
             self.active_panel = Panel::Params;
             if let Some(index) = param_index_at(layout.params, row, self.selected_slot()) {
@@ -281,24 +359,48 @@ impl App {
         Ok(())
     }
 
-    fn drag_param_at(&mut self, column: u16, row: u16, layout: AppLayout) {
-        if !rect_contains(layout.params, column, row) {
-            return;
+    fn begin_param_drag(&mut self, mouse: MouseEvent, layout: AppLayout) -> bool {
+        let Some(index) = param_index_at(layout.params, mouse.row, self.selected_slot()) else {
+            return false;
+        };
+        let Some(slider) = param_slider_area(layout.params, index) else {
+            return false;
+        };
+        if mouse.column < slider.x || mouse.column >= slider.x.saturating_add(slider.width) {
+            return false;
         }
 
         self.active_panel = Panel::Params;
-        let Some(previous) = self.last_drag_col else {
-            self.last_drag_col = Some(column);
-            return;
-        };
-        let delta = i32::from(column) - i32::from(previous);
-        if delta.abs() >= 2 {
-            self.adjust_active_param(delta.signum() as f32);
-            self.last_drag_col = Some(column);
+        self.selected_param = index;
+        let mut start_ratio = self
+            .selected_slot()
+            .map(|slot| slot.param_ratio(index))
+            .unwrap_or(0.0);
+        if !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+            start_ratio = slider_ratio_at(slider, mouse.column);
+            self.set_param_ratio(self.selected_slot, index, start_ratio);
         }
+        self.param_drag = Some(ParamDrag {
+            slot: self.selected_slot,
+            param: index,
+            slider,
+            start_col: mouse.column,
+            start_ratio,
+        });
+        true
     }
 
-    fn scroll_at(&mut self, column: u16, row: u16, delta: isize, layout: AppLayout) {
+    fn drag_param_at(&mut self, mouse: MouseEvent) {
+        let Some(drag) = self.param_drag else {
+            return;
+        };
+        let (ratio, next_drag) =
+            drag.updated(mouse.column, mouse.modifiers.contains(KeyModifiers::SHIFT));
+        self.set_param_ratio(drag.slot, drag.param, ratio);
+        self.param_drag = Some(next_drag);
+    }
+
+    fn scroll_at(&mut self, column: u16, row: u16, delta: isize, layout: AppLayout, fine: bool) {
         if rect_contains(layout.input, column, row) {
             self.active_panel = Panel::Input;
             self.move_selection(delta);
@@ -310,7 +412,8 @@ impl App {
             self.move_selection(delta);
         } else if rect_contains(layout.params, column, row) {
             self.active_panel = Panel::Params;
-            let direction = if delta.is_negative() { 1.0 } else { -1.0 };
+            let scale = if fine { 0.2 } else { 1.0 };
+            let direction = if delta.is_negative() { scale } else { -scale };
             self.adjust_active_param(direction);
         }
     }
@@ -378,9 +481,61 @@ impl App {
         Ok(())
     }
 
-    fn add_slot(&mut self) {
-        self.slots.push(ProcessorSlot::gain());
+    fn handle_effect_picker_key(&mut self, key: KeyEvent) {
+        let selected = self.effect_picker.unwrap_or(0);
+        match key.code {
+            KeyCode::Esc => self.effect_picker = None,
+            KeyCode::Up => self.effect_picker = Some(moved_index(selected, 4, -1)),
+            KeyCode::Down => self.effect_picker = Some(moved_index(selected, 4, 1)),
+            KeyCode::Enter => {
+                self.add_slot(ProcessorKind::ALL[selected]);
+                self.effect_picker = None;
+            }
+            KeyCode::Char(value @ '1'..='4') => {
+                let index = usize::from(value as u8 - b'1');
+                self.add_slot(ProcessorKind::ALL[index]);
+                self.effect_picker = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_chain_action(&mut self, action: ChainAction) {
+        self.active_panel = Panel::Chain;
+        match action {
+            ChainAction::Select(index) => {
+                self.selected_slot = index;
+                self.selected_param = 0;
+            }
+            ChainAction::Toggle(index) => {
+                self.selected_slot = index;
+                self.selected_param = clamped_param(self.selected_slot(), self.selected_param);
+                self.toggle_slot();
+            }
+            ChainAction::MoveUp(index) => {
+                self.selected_slot = index;
+                self.selected_param = clamped_param(self.selected_slot(), self.selected_param);
+                move_slot(&mut self.slots, &mut self.selected_slot, -1);
+                self.rebuild_processor();
+            }
+            ChainAction::MoveDown(index) => {
+                self.selected_slot = index;
+                self.selected_param = clamped_param(self.selected_slot(), self.selected_param);
+                move_slot(&mut self.slots, &mut self.selected_slot, 1);
+                self.rebuild_processor();
+            }
+            ChainAction::Delete(index) => {
+                self.selected_slot = index;
+                self.delete_slot();
+            }
+            ChainAction::Add => self.effect_picker = Some(0),
+        }
+    }
+
+    fn add_slot(&mut self, kind: ProcessorKind) {
+        self.slots.push(ProcessorSlot::new(kind));
         self.selected_slot = self.slots.len().saturating_sub(1);
+        self.selected_param = 0;
         self.rebuild_processor();
     }
 
@@ -398,6 +553,7 @@ impl App {
 
         self.slots.remove(self.selected_slot);
         self.selected_slot = self.selected_slot.min(self.slots.len().saturating_sub(1));
+        self.selected_param = clamped_param(self.selected_slot(), self.selected_param);
         self.rebuild_processor();
     }
 
@@ -450,6 +606,13 @@ impl App {
         }
     }
 
+    fn set_param_ratio(&mut self, slot_index: usize, param: usize, ratio: f32) {
+        if let Some(slot) = self.slots.get_mut(slot_index) {
+            slot.set_param_ratio(param, ratio);
+            self.rebuild_processor();
+        }
+    }
+
     fn rebuild_processor(&mut self) {
         let next = LiveChain::from_slots(&self.slots);
         let updated = if let Ok(mut processor) = self.processor.lock() {
@@ -496,6 +659,15 @@ fn moved_index(current: usize, len: usize, delta: isize) -> usize {
         current.saturating_add(delta as usize).min(last)
     }
 }
+
+fn key_adjustment(modifiers: KeyModifiers) -> f32 {
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        0.2
+    } else {
+        1.0
+    }
+}
+
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
     let right = u32::from(area.x) + u32::from(area.width);
     let bottom = u32::from(area.y) + u32::from(area.height);
@@ -514,13 +686,42 @@ fn inner_area(area: Rect) -> Rect {
     }
 }
 
-fn list_index_at(area: Rect, column: u16, row: u16, len: usize) -> Option<usize> {
+fn effect_picker_area(area: Rect) -> Rect {
+    let width = area.width.min(30);
+    let height = area.height.min(6);
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+fn list_window_start(selected: usize, len: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 || len <= visible_rows {
+        return 0;
+    }
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(len - visible_rows)
+}
+
+fn visible_list_index_at(
+    area: Rect,
+    column: u16,
+    row: u16,
+    len: usize,
+    selected: usize,
+) -> Option<usize> {
     let area = inner_area(area);
     if len == 0 || !rect_contains(area, column, row) {
         return None;
     }
 
-    let index = usize::from(row.saturating_sub(area.y));
+    let start = list_window_start(selected, len, usize::from(area.height));
+    let index = start + usize::from(row.saturating_sub(area.y));
     (index < len).then_some(index)
 }
 
@@ -536,6 +737,103 @@ fn param_index_at(area: Rect, row: u16, slot: Option<&ProcessorSlot>) -> Option<
     (index < slot.param_count()).then_some(index)
 }
 
+fn clamped_param(slot: Option<&ProcessorSlot>, selected_param: usize) -> usize {
+    slot.map(|slot| selected_param.min(slot.param_count().saturating_sub(1)))
+        .unwrap_or(0)
+}
+
+fn param_slider_area(area: Rect, param: usize) -> Option<Rect> {
+    let content = inner_area(area);
+    if content.width <= 26 || param >= usize::from(content.height.saturating_sub(1)) {
+        return None;
+    }
+
+    Some(Rect::new(
+        content.x.saturating_add(13),
+        content
+            .y
+            .saturating_add(1)
+            .saturating_add(u16::try_from(param).unwrap_or(u16::MAX)),
+        content.width - 26,
+        1,
+    ))
+}
+
+fn slider_ratio_at(area: Rect, column: u16) -> f32 {
+    if area.width <= 1 {
+        return 0.0;
+    }
+
+    let offset = column.saturating_sub(area.x).min(area.width - 1);
+    f32::from(offset) / f32::from(area.width - 1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainAction {
+    Select(usize),
+    Toggle(usize),
+    MoveUp(usize),
+    MoveDown(usize),
+    Delete(usize),
+    Add,
+}
+
+fn chain_window(selected: usize, slot_count: usize, capacity: usize) -> (usize, usize) {
+    let start = list_window_start(selected, slot_count, capacity);
+    let count = slot_count.saturating_sub(start).min(capacity);
+    (start, count)
+}
+
+fn chain_action_at(
+    area: Rect,
+    column: u16,
+    row: u16,
+    slot_count: usize,
+    selected: usize,
+) -> Option<ChainAction> {
+    let content = inner_area(area);
+    if !rect_contains(content, column, row) {
+        return None;
+    }
+
+    let capacity = usize::from(content.height.saturating_sub(1));
+    let (start, visible_count) = chain_window(selected, slot_count, capacity);
+    let visible_index = usize::from(row - content.y);
+    if visible_index == visible_count {
+        return Some(ChainAction::Add);
+    }
+    if visible_index > visible_count {
+        return None;
+    }
+    let index = start + visible_index;
+
+    let right = content.x.saturating_add(content.width);
+    let actions_start = right.saturating_sub(11);
+    if column >= right.saturating_sub(3) {
+        Some(ChainAction::Delete(index))
+    } else if column >= right.saturating_sub(7) {
+        Some(ChainAction::MoveDown(index))
+    } else if column >= actions_start {
+        Some(ChainAction::MoveUp(index))
+    } else if column >= content.x.saturating_add(4) && column < content.x.saturating_add(7) {
+        Some(ChainAction::Toggle(index))
+    } else {
+        Some(ChainAction::Select(index))
+    }
+}
+
+fn move_slot(slots: &mut [ProcessorSlot], selected: &mut usize, delta: isize) {
+    if slots.is_empty() {
+        return;
+    }
+
+    let target = moved_index(*selected, slots.len(), delta);
+    if target != *selected {
+        slots.swap(*selected, target);
+        *selected = target;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessorKind {
     Gain,
@@ -545,14 +843,27 @@ enum ProcessorKind {
 }
 
 impl ProcessorKind {
+    const ALL: [Self; 4] = [Self::Gain, Self::LowPass, Self::Delay, Self::Distortion];
+
     fn label(self) -> &'static str {
         match self {
             Self::Gain => "Gain",
             Self::LowPass => "LowPass",
             Self::Delay => "Delay",
-            Self::Distortion => "Distort",
+            Self::Distortion => "Distortion",
         }
     }
+}
+
+fn effect_kind_at(area: Rect, column: u16, row: u16) -> Option<ProcessorKind> {
+    let content = inner_area(area);
+    if !rect_contains(content, column, row) {
+        return None;
+    }
+
+    ProcessorKind::ALL
+        .get(usize::from(row - content.y))
+        .copied()
 }
 
 #[derive(Debug, Clone)]
@@ -568,9 +879,9 @@ struct ProcessorSlot {
 }
 
 impl ProcessorSlot {
-    fn gain() -> Self {
+    fn new(kind: ProcessorKind) -> Self {
         Self {
-            kind: ProcessorKind::Gain,
+            kind,
             enabled: true,
             gain: 1.0,
             cutoff_hz: 2_000.0,
@@ -579,6 +890,10 @@ impl ProcessorSlot {
             mix: 0.35,
             drive: 3.0,
         }
+    }
+
+    fn gain() -> Self {
+        Self::new(ProcessorKind::Gain)
     }
 
     fn param_count(&self) -> usize {
@@ -613,6 +928,42 @@ impl ProcessorSlot {
                 _ => self.mix = (self.mix + direction * 0.025).clamp(0.0, 1.0),
             },
         }
+    }
+
+    fn set_param_ratio(&mut self, param: usize, ratio: f32) {
+        let ratio = ratio.clamp(0.0, 1.0);
+        match self.kind {
+            ProcessorKind::Gain => self.gain = ratio * 4.0,
+            ProcessorKind::LowPass => {
+                self.cutoff_hz = 20.0 * (1_000.0_f32).powf(ratio);
+            }
+            ProcessorKind::Delay => match param {
+                0 => self.delay_ms = ratio * 2_000.0,
+                1 => self.feedback = ratio * 0.95,
+                _ => self.mix = ratio,
+            },
+            ProcessorKind::Distortion => match param {
+                0 => self.drive = 1.0 + ratio * 19.0,
+                _ => self.mix = ratio,
+            },
+        }
+    }
+
+    fn param_ratio(&self, param: usize) -> f32 {
+        match self.kind {
+            ProcessorKind::Gain => self.gain / 4.0,
+            ProcessorKind::LowPass => (self.cutoff_hz / 20.0).ln() / 1_000.0_f32.ln(),
+            ProcessorKind::Delay => match param {
+                0 => self.delay_ms / 2_000.0,
+                1 => self.feedback / 0.95,
+                _ => self.mix,
+            },
+            ProcessorKind::Distortion => match param {
+                0 => (self.drive - 1.0) / 19.0,
+                _ => self.mix,
+            },
+        }
+        .clamp(0.0, 1.0)
     }
 }
 
@@ -716,32 +1067,12 @@ fn build_shared_processor(slots: &[ProcessorSlot]) -> SharedProcessor {
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(5),
-            Constraint::Length(3),
-        ])
-        .split(frame.size());
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(root[1]);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(columns[2]);
+    let layout = AppLayout::new(frame.size());
 
-    draw_status(frame, root[0], app);
+    draw_status(frame, layout.status, app);
     draw_devices(
         frame,
-        columns[0],
+        layout.input,
         "Input",
         &app.input_devices,
         app.selected_input,
@@ -749,16 +1080,19 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     );
     draw_devices(
         frame,
-        columns[1],
+        layout.output,
         "Output",
         &app.output_devices,
         app.selected_output,
         app.active_panel == Panel::Output,
     );
-    draw_chain(frame, right[0], app);
-    draw_params(frame, right[1], app);
-    draw_meters(frame, root[2], app);
-    draw_help(frame, root[3]);
+    draw_chain(frame, layout.chain, app);
+    draw_params(frame, layout.params, app);
+    draw_meters(frame, layout.meters, app);
+    draw_help(frame, layout.help);
+    if let Some(selected) = app.effect_picker {
+        draw_effect_picker(frame, effect_picker_area(frame.size()), selected);
+    }
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -794,8 +1128,12 @@ fn draw_devices(
     let items = if devices.is_empty() {
         vec![ListItem::new("No devices")]
     } else {
+        let visible_rows = usize::from(inner_area(area).height);
+        let start = list_window_start(selected, devices.len(), visible_rows);
         devices
             .iter()
+            .skip(start)
+            .take(visible_rows)
             .map(|device| {
                 let marker = if device.index == selected { "> " } else { "  " };
                 let default = if device.is_default { " [default]" } else { "" };
@@ -811,24 +1149,40 @@ fn draw_devices(
 
 fn draw_chain(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let items = if app.slots.is_empty() {
-        vec![ListItem::new("No slots. Press a to add Gain.")]
+        vec![ListItem::new("+ Add effect")]
     } else {
-        app.slots
+        let capacity = usize::from(inner_area(area).height.saturating_sub(1));
+        let (start, visible_count) = chain_window(app.selected_slot, app.slots.len(), capacity);
+        let mut items: Vec<_> = app
+            .slots
             .iter()
             .enumerate()
+            .skip(start)
+            .take(visible_count)
             .map(|(index, slot)| {
                 let selected = if index == app.selected_slot {
                     "> "
                 } else {
                     "  "
                 };
-                let enabled = if slot.enabled { "on " } else { "off" };
-                ListItem::new(format!(
-                    "{selected}{index}: {:<7} {enabled}",
+                let enabled = if slot.enabled { "●" } else { "○" };
+                let display_index = index + 1;
+                let prefix = format!(
+                    "{selected}{display_index:>2} {enabled} {:<10}",
                     slot.kind.label()
-                ))
+                );
+                let prefix_width = usize::from(inner_area(area).width.saturating_sub(11));
+                let line = format!("{prefix:<prefix_width$}[^] [v] [x]");
+                let style = if slot.enabled {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                ListItem::new(line).style(style)
             })
-            .collect()
+            .collect();
+        items.push(ListItem::new("+ Add effect"));
+        items
     };
     frame.render_widget(
         List::new(items).block(panel_block("Chain", app.active_panel == Panel::Chain)),
@@ -845,10 +1199,10 @@ fn draw_params(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("Enabled: ", Style::default().fg(Color::Gray)),
             Span::raw(if slot.enabled { "yes" } else { "no" }),
         ])];
-        lines.extend(param_lines(slot, app.selected_param));
+        lines.extend(param_lines(slot, app.selected_param, area));
         lines.extend([
-            Line::from("Left/Right adjusts selected parameter."),
-            Line::from("[/] selects parameter, t switches slot type."),
+            Line::from("Click/drag slider; Shift-drag adjusts finely."),
+            Line::from("Wheel or arrows adjust; [/] selects parameter."),
         ]);
         lines
     } else {
@@ -862,39 +1216,123 @@ fn draw_params(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn param_lines(slot: &ProcessorSlot, selected_param: usize) -> Vec<Line<'static>> {
+fn param_lines(slot: &ProcessorSlot, selected_param: usize, area: Rect) -> Vec<Line<'static>> {
     match slot.kind {
         ProcessorKind::Gain => vec![param_line(
             0,
             selected_param,
-            format!("Gain: {:.2}", slot.gain),
+            "Gain",
+            format!("{:.2}", slot.gain),
+            slot.param_ratio(0),
+            area,
         )],
         ProcessorKind::LowPass => vec![param_line(
             0,
             selected_param,
-            format!("Cutoff: {:.0} Hz", slot.cutoff_hz),
+            "Cutoff",
+            format!("{:.0} Hz", slot.cutoff_hz),
+            slot.param_ratio(0),
+            area,
         )],
         ProcessorKind::Delay => vec![
-            param_line(0, selected_param, format!("Delay: {:.0} ms", slot.delay_ms)),
-            param_line(1, selected_param, format!("Feedback: {:.2}", slot.feedback)),
-            param_line(2, selected_param, format!("Mix: {:.2}", slot.mix)),
+            param_line(
+                0,
+                selected_param,
+                "Delay",
+                format!("{:.0} ms", slot.delay_ms),
+                slot.param_ratio(0),
+                area,
+            ),
+            param_line(
+                1,
+                selected_param,
+                "Feedback",
+                format!("{:.2}", slot.feedback),
+                slot.param_ratio(1),
+                area,
+            ),
+            param_line(
+                2,
+                selected_param,
+                "Mix",
+                format!("{:.0}%", slot.mix * 100.0),
+                slot.param_ratio(2),
+                area,
+            ),
         ],
         ProcessorKind::Distortion => vec![
-            param_line(0, selected_param, format!("Drive: {:.2}", slot.drive)),
-            param_line(1, selected_param, format!("Mix: {:.2}", slot.mix)),
+            param_line(
+                0,
+                selected_param,
+                "Drive",
+                format!("{:.2}", slot.drive),
+                slot.param_ratio(0),
+                area,
+            ),
+            param_line(
+                1,
+                selected_param,
+                "Mix",
+                format!("{:.0}%", slot.mix * 100.0),
+                slot.param_ratio(1),
+                area,
+            ),
         ],
     }
 }
 
-fn param_line(index: usize, selected_param: usize, text: String) -> Line<'static> {
-    if index == selected_param {
-        Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(text, Style::default().add_modifier(Modifier::BOLD)),
-        ])
+fn param_line(
+    index: usize,
+    selected_param: usize,
+    name: &'static str,
+    value: String,
+    ratio: f32,
+    area: Rect,
+) -> Line<'static> {
+    let selected = index == selected_param;
+    let marker = if selected { "> " } else { "  " };
+    let Some(slider) = param_slider_area(area, index) else {
+        return Line::from(format!("{marker}{name}: {value}"));
+    };
+    let width = usize::from(slider.width);
+    let filled = ((ratio.clamp(0.0, 1.0) * width as f32).round() as usize).min(width);
+    let marker_style = if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Line::from(format!("  {text}"))
-    }
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(marker, marker_style),
+        Span::styled(format!("{name:<9} ["), marker_style),
+        Span::styled("█".repeat(filled), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            "─".repeat(width - filled),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(format!("] {value}")),
+    ])
+}
+
+fn draw_effect_picker(frame: &mut Frame<'_>, area: Rect, selected: usize) {
+    let items = ProcessorKind::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let marker = if index == selected { "> " } else { "  " };
+            ListItem::new(format!("{marker}{}. {}", index + 1, kind.label()))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Add effect (1-4)"),
+        ),
+        area,
+    );
 }
 
 fn draw_meters(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -919,7 +1357,7 @@ fn render_meter(frame: &mut Frame<'_>, area: Rect, title: &str, stats: AudioStat
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let text = "Tab panels | Space start/stop | Enter apply | mouse click selects | wheel navigates/adjusts | drag params | arrows adjust | q quit";
+    let text = "a add | chain actions | drag sliders (Shift fine) | Space stream | q quit";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL))
@@ -973,5 +1411,151 @@ mod tests {
         let chain = LiveChain::from_slots(&slots);
 
         assert_eq!(chain.processors.len(), 2);
+    }
+
+    #[test]
+    fn slider_ratio_uses_the_full_control_width_and_clamps() {
+        let area = Rect::new(10, 4, 11, 1);
+
+        assert_eq!(slider_ratio_at(area, 5), 0.0);
+        assert_eq!(slider_ratio_at(area, 10), 0.0);
+        assert_eq!(slider_ratio_at(area, 15), 0.5);
+        assert_eq!(slider_ratio_at(area, 20), 1.0);
+        assert_eq!(slider_ratio_at(area, 30), 1.0);
+    }
+
+    #[test]
+    fn setting_cutoff_from_slider_uses_a_logarithmic_scale() {
+        let mut slot = ProcessorSlot {
+            kind: ProcessorKind::LowPass,
+            ..ProcessorSlot::gain()
+        };
+
+        slot.set_param_ratio(0, 0.0);
+        assert_eq!(slot.cutoff_hz, 20.0);
+        slot.set_param_ratio(0, 1.0);
+        assert_eq!(slot.cutoff_hz, 20_000.0);
+        slot.set_param_ratio(0, 0.5);
+        assert!((slot.cutoff_hz - 632.46).abs() < 0.01);
+    }
+
+    #[test]
+    fn chain_hit_test_finds_slot_actions_and_add_row() {
+        let area = Rect::new(0, 0, 30, 8);
+
+        assert_eq!(
+            chain_action_at(area, 5, 1, 2, 0),
+            Some(ChainAction::Toggle(0))
+        );
+        assert_eq!(
+            chain_action_at(area, 18, 1, 2, 0),
+            Some(ChainAction::MoveUp(0))
+        );
+        assert_eq!(
+            chain_action_at(area, 22, 2, 2, 0),
+            Some(ChainAction::MoveDown(1))
+        );
+        assert_eq!(
+            chain_action_at(area, 26, 2, 2, 0),
+            Some(ChainAction::Delete(1))
+        );
+        assert_eq!(chain_action_at(area, 4, 3, 2, 0), Some(ChainAction::Add));
+    }
+
+    #[test]
+    fn moving_a_slot_keeps_the_moved_effect_selected() {
+        let mut slots = vec![
+            ProcessorSlot::gain(),
+            ProcessorSlot {
+                kind: ProcessorKind::Delay,
+                ..ProcessorSlot::gain()
+            },
+        ];
+        let mut selected = 1;
+
+        move_slot(&mut slots, &mut selected, -1);
+
+        assert_eq!(selected, 0);
+        assert_eq!(slots[0].kind, ProcessorKind::Delay);
+    }
+
+    #[test]
+    fn effect_picker_maps_each_visible_row_to_its_kind() {
+        let area = Rect::new(10, 4, 28, 6);
+
+        assert_eq!(effect_kind_at(area, 12, 5), Some(ProcessorKind::Gain));
+        assert_eq!(effect_kind_at(area, 12, 6), Some(ProcessorKind::LowPass));
+        assert_eq!(effect_kind_at(area, 12, 7), Some(ProcessorKind::Delay));
+        assert_eq!(effect_kind_at(area, 12, 8), Some(ProcessorKind::Distortion));
+        assert_eq!(effect_kind_at(area, 12, 9), None);
+    }
+
+    #[test]
+    fn parameter_slider_leaves_space_for_label_and_value() {
+        let panel = Rect::new(20, 3, 60, 10);
+
+        assert_eq!(param_slider_area(panel, 0), Some(Rect::new(34, 5, 32, 1)));
+        assert_eq!(param_slider_area(panel, 2), Some(Rect::new(34, 7, 32, 1)));
+    }
+
+    #[test]
+    fn processor_kind_constructor_creates_the_requested_effect() {
+        let slot = ProcessorSlot::new(ProcessorKind::Distortion);
+
+        assert_eq!(slot.kind, ProcessorKind::Distortion);
+        assert!(slot.enabled);
+        assert_eq!(slot.drive, 3.0);
+    }
+
+    #[test]
+    fn compact_device_list_keeps_selection_visible_and_clicks_absolute_index() {
+        let area = Rect::new(0, 0, 30, 5);
+
+        assert_eq!(list_window_start(5, 8, 3), 3);
+        assert_eq!(visible_list_index_at(area, 2, 1, 8, 5), Some(3));
+        assert_eq!(visible_list_index_at(area, 2, 3, 8, 5), Some(5));
+    }
+
+    #[test]
+    fn overflowing_chain_keeps_selected_slot_and_add_action_visible() {
+        let area = Rect::new(0, 0, 30, 6);
+
+        assert_eq!(chain_window(7, 8, 3), (5, 3));
+        assert_eq!(
+            chain_action_at(area, 4, 1, 8, 7),
+            Some(ChainAction::Select(5))
+        );
+        assert_eq!(chain_action_at(area, 4, 4, 8, 7), Some(ChainAction::Add));
+    }
+
+    #[test]
+    fn switching_from_coarse_to_fine_drag_keeps_value_continuous() {
+        let drag = ParamDrag {
+            slot: 0,
+            param: 0,
+            slider: Rect::new(10, 4, 11, 1),
+            start_col: 10,
+            start_ratio: 0.2,
+        };
+
+        let (coarse_ratio, drag) = drag.updated(15, false);
+        let (fine_ratio, _) = drag.updated(16, true);
+
+        assert_eq!(coarse_ratio, 0.5);
+        assert!((fine_ratio - 0.505).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn changing_to_slot_with_fewer_params_clamps_parameter_selection() {
+        let gain = ProcessorSlot::gain();
+
+        assert_eq!(clamped_param(Some(&gain), 2), 0);
+        assert_eq!(clamped_param(None, 2), 0);
+    }
+
+    #[test]
+    fn shift_modifier_requests_fine_keyboard_adjustment() {
+        assert_eq!(key_adjustment(KeyModifiers::NONE), 1.0);
+        assert_eq!(key_adjustment(KeyModifiers::SHIFT), 0.2);
     }
 }

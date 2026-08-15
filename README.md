@@ -79,7 +79,9 @@ cargo run -p real_audio --bin live_tui
 The TUI lets you select input/output devices, start and stop streaming, restart
 after changing devices, and edit a slot-based DSP chain. It supports gain,
 one-pole low-pass, delay, and soft-clipping distortion slots, with live peak/RMS
-meters for input and output.
+meters for input and output. Press `a` or click `+ Add effect` to choose an
+effect directly. Chain rows expose bypass, move, and delete controls; parameters
+use clickable sliders with captured drag and `Shift` for fine adjustment.
 
 ## Example
 
