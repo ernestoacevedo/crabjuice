@@ -231,6 +231,136 @@ impl AudioProcessor for DistortionProcessor {
     fn reset(&mut self) {}
 }
 
+/// A monophonic pitch estimate produced by [`PitchDetector`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PitchEstimate {
+    pub frequency_hz: f32,
+    pub midi_note: i16,
+    pub cents: f32,
+    pub confidence: f32,
+}
+
+/// Monophonic pitch detector using the YIN difference function.
+#[derive(Debug, Clone, Copy)]
+pub struct PitchDetector {
+    sample_rate: f32,
+    min_frequency_hz: f32,
+    max_frequency_hz: f32,
+}
+
+impl PitchDetector {
+    const RMS_THRESHOLD: f32 = 0.01;
+    const YIN_THRESHOLD: f32 = 0.15;
+    const MIN_CONFIDENCE: f32 = 0.8;
+
+    /// Creates a detector for the requested sample rate and frequency range.
+    pub fn new(sample_rate: f32, min_frequency_hz: f32, max_frequency_hz: f32) -> Self {
+        Self {
+            sample_rate: sample_rate.max(1.0),
+            min_frequency_hz: min_frequency_hz.max(1.0),
+            max_frequency_hz: max_frequency_hz.max(min_frequency_hz.max(1.0)),
+        }
+    }
+
+    /// Estimates the fundamental frequency of a mono sample window.
+    pub fn estimate(&self, samples: &[f32]) -> Option<PitchEstimate> {
+        if samples.is_empty() || rms(samples) < Self::RMS_THRESHOLD {
+            return None;
+        }
+
+        let min_tau = (self.sample_rate / self.max_frequency_hz).floor() as usize;
+        let max_tau = ((self.sample_rate / self.min_frequency_hz).ceil() as usize)
+            .min(samples.len().saturating_sub(1) / 2);
+        if max_tau <= min_tau.max(1) {
+            return None;
+        }
+
+        let mut difference = vec![0.0; max_tau + 1];
+        let comparison_len = samples.len() - max_tau;
+        for (tau, value) in difference.iter_mut().enumerate().skip(1) {
+            *value = samples
+                .iter()
+                .take(comparison_len)
+                .zip(samples.iter().skip(tau))
+                .map(|(left, right)| {
+                    let delta = left - right;
+                    delta * delta
+                })
+                .sum();
+        }
+
+        let mut cumulative = 0.0;
+        for (tau, value) in difference.iter_mut().enumerate().skip(1) {
+            cumulative += *value;
+            *value = if cumulative > f32::EPSILON {
+                *value * tau as f32 / cumulative
+            } else {
+                1.0
+            };
+        }
+
+        let has_too_high_period = (2..min_tau).any(|tau| {
+            difference[tau] < Self::YIN_THRESHOLD
+                && difference[tau] <= difference[tau - 1]
+                && difference[tau] <= difference[tau + 1]
+        });
+        if has_too_high_period {
+            return None;
+        }
+
+        let mut tau = min_tau.max(2);
+        while tau <= max_tau {
+            if difference[tau] < Self::YIN_THRESHOLD {
+                while tau < max_tau && difference[tau + 1] < difference[tau] {
+                    tau += 1;
+                }
+                break;
+            }
+            tau += 1;
+        }
+        if tau > max_tau {
+            return None;
+        }
+
+        let confidence = 1.0 - difference[tau];
+        if confidence < Self::MIN_CONFIDENCE {
+            return None;
+        }
+
+        let refined_tau = parabolic_tau(&difference, tau);
+        let frequency_hz = self.sample_rate / refined_tau;
+        let midi = 69.0 + 12.0 * (frequency_hz / 440.0).log2();
+        let midi_note = midi.round() as i16;
+
+        Some(PitchEstimate {
+            frequency_hz,
+            midi_note,
+            cents: (midi - f32::from(midi_note)) * 100.0,
+            confidence,
+        })
+    }
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    let sum_squares = samples.iter().map(|sample| sample * sample).sum::<f32>();
+    (sum_squares / samples.len() as f32).sqrt()
+}
+
+fn parabolic_tau(values: &[f32], tau: usize) -> f32 {
+    if tau == 0 || tau + 1 >= values.len() {
+        return tau as f32;
+    }
+    let left = values[tau - 1];
+    let center = values[tau];
+    let right = values[tau + 1];
+    let denominator = 2.0 * (2.0 * center - right - left);
+    if denominator.abs() <= f32::EPSILON {
+        tau as f32
+    } else {
+        tau as f32 + (right - left) / denominator
+    }
+}
+
 /// Fixed-capacity circular delay line for `f32` samples.
 #[derive(Debug, Clone)]
 pub struct DelayLine {
@@ -420,6 +550,14 @@ mod tests {
     use super::*;
     use crabjuice_audio::AudioBuffer;
 
+    fn sine_wave(frequency_hz: f32, sample_rate: f32, samples: usize) -> Vec<f32> {
+        (0..samples)
+            .map(|index| {
+                (2.0 * core::f32::consts::PI * frequency_hz * index as f32 / sample_rate).sin()
+            })
+            .collect()
+    }
+
     fn process<P: AudioProcessor>(processor: &mut P, buffer: &mut AudioBuffer<f32>) {
         let mut ctx = ProcessContext::new(buffer, &[]);
         processor.process(&mut ctx);
@@ -549,5 +687,59 @@ mod tests {
         assert!(channel[1] > 0.0 && channel[1] < 1.0);
         assert!(channel[2] > channel[1]);
         assert!(channel[3] > channel[2]);
+    }
+
+    #[test]
+    fn pitch_detector_estimates_a4_from_a_sine_wave() {
+        let sample_rate = 48_000.0;
+        let samples = sine_wave(440.0, sample_rate, 4_800);
+        let detector = PitchDetector::new(sample_rate, 55.0, 1_760.0);
+
+        let estimate = detector
+            .estimate(&samples)
+            .expect("a clear in-range tone should be detected");
+
+        assert!((estimate.frequency_hz - 440.0).abs() < 1.0);
+        assert_eq!(estimate.midi_note, 69);
+        assert!(estimate.cents.abs() < 3.0);
+        assert!(estimate.confidence >= 0.8);
+    }
+
+    #[test]
+    fn pitch_detector_estimates_low_guitar_e() {
+        let sample_rate = 44_100.0;
+        let samples = sine_wave(82.406_89, sample_rate, 4_410);
+        let detector = PitchDetector::new(sample_rate, 55.0, 1_760.0);
+
+        let estimate = detector
+            .estimate(&samples)
+            .expect("low guitar E should be detected");
+
+        assert!((estimate.frequency_hz - 82.406_89).abs() < 1.0);
+        assert_eq!(estimate.midi_note, 40);
+        assert!(estimate.cents.abs() < 3.0);
+    }
+
+    #[test]
+    fn pitch_detector_rejects_silence_and_quiet_signals() {
+        let detector = PitchDetector::new(48_000.0, 55.0, 1_760.0);
+        let silence = vec![0.0; 4_800];
+        let quiet = sine_wave(440.0, 48_000.0, 4_800)
+            .into_iter()
+            .map(|sample| sample * 0.001)
+            .collect::<Vec<_>>();
+
+        assert_eq!(detector.estimate(&silence), None);
+        assert_eq!(detector.estimate(&quiet), None);
+    }
+
+    #[test]
+    fn pitch_detector_rejects_frequencies_outside_its_range() {
+        let detector = PitchDetector::new(48_000.0, 55.0, 1_760.0);
+        let below_range = sine_wave(30.0, 48_000.0, 4_800);
+        let above_range = sine_wave(2_000.0, 48_000.0, 4_800);
+
+        assert_eq!(detector.estimate(&below_range), None);
+        assert_eq!(detector.estimate(&above_range), None);
     }
 }

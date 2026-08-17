@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use cpal::Host;
 use crabjuice_audio::{AudioProcessor, ProcessContext};
-use crabjuice_dsp::{DelayProcessor, DistortionProcessor, GainProcessor, OnePoleLowPass};
+use crabjuice_dsp::{
+    DelayProcessor, DistortionProcessor, GainProcessor, OnePoleLowPass, PitchDetector,
+    PitchEstimate,
+};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -18,12 +21,13 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, 
 use ratatui::{Frame, Terminal};
 use real_audio::{
     default_input_index, default_output_index, input_devices, output_devices, select_input_device,
-    select_output_device, start_live_audio, AudioStats, DeviceInfo, LiveAudioSession,
-    SharedProcessor,
+    select_output_device, start_live_audio, start_tuner_audio, AudioStats, DeviceInfo,
+    LiveAudioSession, SharedProcessor, TunerSession,
 };
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
@@ -37,9 +41,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut app = App::new(host)?;
 
     loop {
+        app.update_tuner();
         terminal.draw(|frame| draw(frame, &app))?;
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
                     if app.handle_key(key)? {
@@ -52,7 +57,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         }
     }
 
-    app.stop_stream();
+    app.stop_all();
     Ok(())
 }
 
@@ -109,6 +114,40 @@ enum Panel {
     Output,
     Chain,
     Params,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppView {
+    Live,
+    Tuner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunerMode {
+    Chromatic,
+    Guitar,
+}
+
+impl TunerMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Chromatic => Self::Guitar,
+            Self::Guitar => Self::Chromatic,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chromatic => "Chromatic",
+            Self::Guitar => "Guitar",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TunerReading {
+    estimate: PitchEstimate,
+    updated_at: Instant,
 }
 
 impl Panel {
@@ -176,6 +215,40 @@ impl AppLayout {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct TunerLayout {
+    status: Rect,
+    input: Rect,
+    mode: Rect,
+    tuner: Rect,
+    meter: Rect,
+    help: Rect,
+}
+
+impl TunerLayout {
+    fn new(area: Rect) -> Self {
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ])
+            .split(area);
+        Self {
+            status: root[0],
+            input: root[1],
+            mode: root[2],
+            tuner: root[3],
+            meter: root[4],
+            help: root[5],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ParamDrag {
     slot: usize,
     param: usize,
@@ -217,6 +290,13 @@ struct App {
     status: String,
     effect_picker: Option<usize>,
     param_drag: Option<ParamDrag>,
+    view: AppView,
+    tuner_mode: TunerMode,
+    tuner_session: Option<TunerSession>,
+    pitch_detector: Option<PitchDetector>,
+    pitch_history: VecDeque<PitchEstimate>,
+    tuner_reading: Option<TunerReading>,
+    last_tuner_analysis: Instant,
 }
 
 impl App {
@@ -243,10 +323,26 @@ impl App {
             status: "Stopped".to_string(),
             effect_picker: None,
             param_drag: None,
+            view: AppView::Live,
+            tuner_mode: TunerMode::Chromatic,
+            tuner_session: None,
+            pitch_detector: None,
+            pitch_history: VecDeque::with_capacity(5),
+            tuner_reading: None,
+            last_tuner_analysis: Instant::now(),
         })
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.code == KeyCode::Char('T') {
+            self.toggle_view();
+            return Ok(false);
+        }
+
+        if self.view == AppView::Tuner {
+            return Ok(self.handle_tuner_key(key));
+        }
+
         if self.effect_picker.is_some() {
             self.handle_effect_picker_key(key);
             return Ok(false);
@@ -275,7 +371,33 @@ impl App {
         Ok(false)
     }
 
+    fn handle_tuner_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Char('m') => self.tuner_mode = self.tuner_mode.toggled(),
+            KeyCode::Char(' ') => self.toggle_tuner(),
+            KeyCode::Char('r') => self.restart_tuner(),
+            KeyCode::Up => self.move_tuner_input(-1),
+            KeyCode::Down => self.move_tuner_input(1),
+            _ => {}
+        }
+        false
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent, terminal_area: Rect) -> Result<()> {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(view) = view_at(terminal_area, mouse.column, mouse.row) {
+                if view != self.view {
+                    self.set_view(view);
+                }
+                return Ok(());
+            }
+        }
+        if self.view == AppView::Tuner {
+            self.handle_tuner_mouse(mouse, terminal_area);
+            return Ok(());
+        }
+
         let layout = AppLayout::new(terminal_area);
 
         if self.effect_picker.is_some() {
@@ -320,6 +442,33 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn handle_tuner_mouse(&mut self, mouse: MouseEvent, terminal_area: Rect) {
+        let layout = TunerLayout::new(terminal_area);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = visible_list_index_at(
+                    layout.input,
+                    mouse.column,
+                    mouse.row,
+                    self.input_devices.len(),
+                    self.selected_input,
+                ) {
+                    self.selected_input = index;
+                    self.restart_tuner();
+                } else if rect_contains(layout.mode, mouse.column, mouse.row) {
+                    self.tuner_mode = self.tuner_mode.toggled();
+                }
+            }
+            MouseEventKind::ScrollUp if rect_contains(layout.input, mouse.column, mouse.row) => {
+                self.move_tuner_input(-1);
+            }
+            MouseEventKind::ScrollDown if rect_contains(layout.input, mouse.column, mouse.row) => {
+                self.move_tuner_input(1);
+            }
+            _ => {}
+        }
     }
 
     fn click_at(&mut self, column: u16, row: u16, layout: AppLayout) -> Result<()> {
@@ -467,6 +616,144 @@ impl App {
             }
         }
         self.status = "Stopped".to_string();
+    }
+
+    fn toggle_view(&mut self) {
+        let next = match self.view {
+            AppView::Live => AppView::Tuner,
+            AppView::Tuner => AppView::Live,
+        };
+        self.set_view(next);
+    }
+
+    fn set_view(&mut self, view: AppView) {
+        if view == self.view {
+            return;
+        }
+        match view {
+            AppView::Live => {
+                self.stop_tuner();
+                self.view = AppView::Live;
+                self.status = "Stopped".to_string();
+            }
+            AppView::Tuner => {
+                self.stop_stream();
+                self.view = AppView::Tuner;
+                self.start_tuner();
+            }
+        }
+    }
+
+    fn start_tuner(&mut self) {
+        if self.input_devices.is_empty() {
+            self.status = "No input devices available".to_string();
+            return;
+        }
+        let input_device = match select_input_device(&self.host, self.selected_input) {
+            Ok(device) => device,
+            Err(error) => {
+                self.status = format!("Tuner input failed: {error}");
+                return;
+            }
+        };
+        let session = match start_tuner_audio(input_device) {
+            Ok(session) => session,
+            Err(error) => {
+                self.status = format!("Tuner start failed: {error}");
+                return;
+            }
+        };
+        if let Err(error) = session.play() {
+            self.status = format!("Tuner play failed: {error}");
+            return;
+        }
+        let sample_rate = session.input_config.sample_rate().0 as f32;
+        self.pitch_detector = Some(PitchDetector::new(sample_rate, 55.0, 1_760.0));
+        self.pitch_history.clear();
+        self.tuner_reading = None;
+        self.last_tuner_analysis = Instant::now();
+        self.status = "Tuner running".to_string();
+        self.tuner_session = Some(session);
+    }
+
+    fn stop_tuner(&mut self) {
+        if let Some(session) = self.tuner_session.take() {
+            if let Err(error) = session.stop() {
+                self.status = format!("Tuner stop failed: {error}");
+            }
+        }
+        self.pitch_detector = None;
+        self.pitch_history.clear();
+        self.tuner_reading = None;
+    }
+
+    fn toggle_tuner(&mut self) {
+        if self.tuner_session.is_some() {
+            self.stop_tuner();
+            self.status = "Tuner stopped".to_string();
+        } else {
+            self.start_tuner();
+        }
+    }
+
+    fn restart_tuner(&mut self) {
+        self.stop_tuner();
+        self.start_tuner();
+    }
+
+    fn move_tuner_input(&mut self, delta: isize) {
+        let next = moved_index(self.selected_input, self.input_devices.len(), delta);
+        if next != self.selected_input {
+            self.selected_input = next;
+            self.restart_tuner();
+        }
+    }
+
+    fn update_tuner(&mut self) {
+        const ANALYSIS_INTERVAL: Duration = Duration::from_millis(50);
+        const READING_TIMEOUT: Duration = Duration::from_millis(500);
+
+        if self.view != AppView::Tuner || self.last_tuner_analysis.elapsed() < ANALYSIS_INTERVAL {
+            return;
+        }
+        self.last_tuner_analysis = Instant::now();
+
+        let estimate = self
+            .tuner_session
+            .as_ref()
+            .zip(self.pitch_detector.as_ref())
+            .and_then(|(session, detector)| {
+                let samples = session.samples();
+                let sample_rate = session.input_config.sample_rate().0 as f32;
+                let window_len = ((sample_rate / 55.0) * 3.0).ceil() as usize;
+                if samples.len() < window_len {
+                    return None;
+                }
+                detector.estimate(&samples[samples.len() - window_len..])
+            });
+
+        if let Some(estimate) = estimate {
+            if self.pitch_history.len() == 5 {
+                self.pitch_history.pop_front();
+            }
+            self.pitch_history.push_back(estimate);
+            self.tuner_reading =
+                median_estimate(&self.pitch_history).map(|estimate| TunerReading {
+                    estimate,
+                    updated_at: Instant::now(),
+                });
+        } else if self
+            .tuner_reading
+            .is_some_and(|reading| reading.updated_at.elapsed() >= READING_TIMEOUT)
+        {
+            self.tuner_reading = None;
+            self.pitch_history.clear();
+        }
+    }
+
+    fn stop_all(&mut self) {
+        self.stop_tuner();
+        self.stop_stream();
     }
 
     fn activate_selection(&mut self) -> Result<()> {
@@ -657,6 +944,26 @@ fn moved_index(current: usize, len: usize, delta: isize) -> usize {
         current.saturating_sub(delta.unsigned_abs()).min(last)
     } else {
         current.saturating_add(delta as usize).min(last)
+    }
+}
+
+fn median_estimate(history: &VecDeque<PitchEstimate>) -> Option<PitchEstimate> {
+    let mut estimates = history.iter().copied().collect::<Vec<_>>();
+    estimates.sort_by(|left, right| left.frequency_hz.total_cmp(&right.frequency_hz));
+    estimates.get(estimates.len() / 2).copied()
+}
+
+fn view_at(area: Rect, column: u16, row: u16) -> Option<AppView> {
+    if row != area.y.saturating_add(1) {
+        return None;
+    }
+    let offset = column.saturating_sub(area.x);
+    if (1..=6).contains(&offset) {
+        Some(AppView::Live)
+    } else if (8..=14).contains(&offset) {
+        Some(AppView::Tuner)
+    } else {
+        None
     }
 }
 
@@ -1066,7 +1373,50 @@ fn build_shared_processor(slots: &[ProcessorSlot]) -> SharedProcessor {
     Arc::new(Mutex::new(Box::new(LiveChain::from_slots(slots))))
 }
 
+fn note_label(midi_note: i16) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let name = NAMES[midi_note.rem_euclid(12) as usize];
+    let octave = midi_note.div_euclid(12) - 1;
+    format!("{name}{octave}")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GuitarTarget {
+    index: usize,
+    label: &'static str,
+    frequency_hz: f32,
+    cents: f32,
+}
+
+fn guitar_target(frequency_hz: f32) -> GuitarTarget {
+    const STRINGS: [(&str, f32); 6] = [
+        ("E2", 82.406_89),
+        ("A2", 110.0),
+        ("D3", 146.832_38),
+        ("G3", 195.997_71),
+        ("B3", 246.941_65),
+        ("E4", 329.627_56),
+    ];
+    STRINGS
+        .iter()
+        .enumerate()
+        .map(|(index, (label, target_hz))| GuitarTarget {
+            index,
+            label,
+            frequency_hz: *target_hz,
+            cents: 1_200.0 * (frequency_hz / target_hz).log2(),
+        })
+        .min_by(|left, right| left.cents.abs().total_cmp(&right.cents.abs()))
+        .expect("standard guitar tuning is not empty")
+}
+
 fn draw(frame: &mut Frame<'_>, app: &App) {
+    if app.view == AppView::Tuner {
+        draw_tuner_view(frame, app);
+        return;
+    }
     let layout = AppLayout::new(frame.size());
 
     draw_status(frame, layout.status, app);
@@ -1096,7 +1446,14 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let line = if let Some(session) = &app.session {
+    let status = if let Some(session) = &app.tuner_session {
+        format!(
+            "{} | {} | {} Hz",
+            app.status,
+            session.input_name,
+            session.input_config.sample_rate().0
+        )
+    } else if let Some(session) = &app.session {
         format!(
             "{} | {} -> {} | {} Hz",
             app.status,
@@ -1107,6 +1464,26 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         format!("{} | stream stopped", app.status)
     };
+    let live_style = if app.view == AppView::Live {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let tuner_style = if app.view == AppView::Tuner {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let line = Line::from(vec![
+        Span::styled("[Live]", live_style),
+        Span::raw(" "),
+        Span::styled("[Tuner]", tuner_style),
+        Span::raw(format!("  {status}")),
+    ]);
     frame.render_widget(
         Paragraph::new(line).block(
             Block::default()
@@ -1115,6 +1492,135 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         area,
     );
+}
+
+fn draw_tuner_view(frame: &mut Frame<'_>, app: &App) {
+    let layout = TunerLayout::new(frame.size());
+    draw_status(frame, layout.status, app);
+    draw_devices(
+        frame,
+        layout.input,
+        "Tuner input",
+        &app.input_devices,
+        app.selected_input,
+        true,
+    );
+    let mode_line = Line::from(vec![
+        Span::raw("Mode: "),
+        Span::styled(
+            app.tuner_mode.label(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  (m or click to toggle)"),
+    ]);
+    frame.render_widget(
+        Paragraph::new(mode_line).block(Block::default().borders(Borders::ALL).title("Mode")),
+        layout.mode,
+    );
+    draw_tuner_panel(frame, layout.tuner, app.tuner_mode, app.tuner_reading);
+    let stats = app
+        .tuner_session
+        .as_ref()
+        .map(TunerSession::input_stats)
+        .unwrap_or_default();
+    render_meter(frame, layout.meter, "Input level", stats);
+    frame.render_widget(
+        Paragraph::new("↑/↓ input | m mode | Space capture | r retry | Shift+T Live | q quit")
+            .block(Block::default().borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+        layout.help,
+    );
+}
+
+fn draw_tuner_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    mode: TunerMode,
+    reading: Option<TunerReading>,
+) {
+    let Some(reading) = reading else {
+        frame.render_widget(
+            Paragraph::new("No signal")
+                .block(Block::default().borders(Borders::ALL).title("Tuner")),
+            area,
+        );
+        return;
+    };
+
+    let estimate = reading.estimate;
+    let (label, cents, guitar) = match mode {
+        TunerMode::Chromatic => (note_label(estimate.midi_note), estimate.cents, None),
+        TunerMode::Guitar => {
+            let target = guitar_target(estimate.frequency_hz);
+            (target.label.to_string(), target.cents, Some(target))
+        }
+    };
+    let color = if cents.abs() <= 5.0 {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+    let bar_width = usize::from(inner_area(area).width).clamp(11, 61);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "{:.2} Hz   {:+.1} cents   confidence {:.0}%",
+            estimate.frequency_hz,
+            cents,
+            estimate.confidence * 100.0
+        )),
+        Line::from(Span::styled(
+            tuning_bar(cents, bar_width),
+            Style::default().fg(color),
+        )),
+        Line::from("-50 cents                 0                 +50 cents"),
+    ];
+    if let Some(target) = guitar {
+        let labels = ["E2", "A2", "D3", "G3", "B3", "E4"];
+        let strings = labels
+            .iter()
+            .enumerate()
+            .flat_map(|(index, label)| {
+                let style = if index == target.index {
+                    Style::default().fg(color).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                [Span::styled(format!(" {label} "), style), Span::raw(" ")]
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::from(strings));
+        lines.push(Line::from(format!("Target {:.2} Hz", target.frequency_hz)));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Tuner"))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn tuning_bar(cents: f32, width: usize) -> String {
+    let width = width.max(3);
+    let position =
+        (((cents.clamp(-50.0, 50.0) + 50.0) / 100.0) * (width - 1) as f32).round() as usize;
+    let center = width / 2;
+    (0..width)
+        .map(|index| {
+            if index == position {
+                '▲'
+            } else if index == center {
+                '│'
+            } else {
+                '─'
+            }
+        })
+        .collect()
 }
 
 fn draw_devices(
@@ -1357,7 +1863,8 @@ fn render_meter(frame: &mut Frame<'_>, area: Rect, title: &str, stats: AudioStat
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let text = "a add | chain actions | drag sliders (Shift fine) | Space stream | q quit";
+    let text =
+        "a add | chain actions | drag sliders (Shift fine) | Space stream | Shift+T tuner | q quit";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL))
@@ -1383,6 +1890,7 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn moved_index_clamps_to_available_range() {
@@ -1557,5 +2065,79 @@ mod tests {
     fn shift_modifier_requests_fine_keyboard_adjustment() {
         assert_eq!(key_adjustment(KeyModifiers::NONE), 1.0);
         assert_eq!(key_adjustment(KeyModifiers::SHIFT), 0.2);
+    }
+
+    #[test]
+    fn note_label_uses_scientific_pitch_notation() {
+        assert_eq!(note_label(69), "A4");
+        assert_eq!(note_label(40), "E2");
+        assert_eq!(note_label(60), "C4");
+    }
+
+    #[test]
+    fn guitar_target_selects_the_nearest_standard_string() {
+        let low_e = guitar_target(82.406_89);
+        let a = guitar_target(110.0);
+
+        assert_eq!(low_e.label, "E2");
+        assert!(low_e.cents.abs() < 0.01);
+        assert_eq!(a.label, "A2");
+        assert!(a.cents.abs() < 0.01);
+    }
+
+    #[test]
+    fn tuner_tabs_map_clicks_to_the_requested_view() {
+        let area = Rect::new(0, 0, 80, 24);
+
+        assert_eq!(view_at(area, 2, 1), Some(AppView::Live));
+        assert_eq!(view_at(area, 10, 1), Some(AppView::Tuner));
+        assert_eq!(view_at(area, 20, 1), None);
+    }
+
+    #[test]
+    fn tuning_bar_centers_and_clamps_the_pitch_marker() {
+        assert_eq!(tuning_bar(0.0, 11), "─────▲─────");
+        assert_eq!(tuning_bar(-80.0, 11), "▲────│─────");
+        assert_eq!(tuning_bar(80.0, 11), "─────│────▲");
+    }
+
+    #[test]
+    fn tuner_panel_renders_no_signal_in_a_compact_terminal() {
+        let backend = TestBackend::new(60, 18);
+        let mut terminal = Terminal::new(backend).expect("test terminal can be created");
+
+        terminal
+            .draw(|frame| draw_tuner_panel(frame, frame.size(), TunerMode::Chromatic, None))
+            .expect("compact tuner panel should render");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("No signal"));
+    }
+
+    #[test]
+    fn median_estimate_rejects_a_single_frequency_outlier() {
+        let estimate = |frequency_hz| PitchEstimate {
+            frequency_hz,
+            midi_note: 69,
+            cents: 0.0,
+            confidence: 0.95,
+        };
+        let history = VecDeque::from([
+            estimate(440.0),
+            estimate(880.0),
+            estimate(439.8),
+            estimate(440.2),
+            estimate(439.9),
+        ]);
+
+        let median = median_estimate(&history).expect("history is not empty");
+
+        assert_eq!(median.frequency_hz, 440.0);
     }
 }
