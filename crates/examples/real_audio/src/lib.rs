@@ -7,6 +7,7 @@ use crabjuice_audio::{AudioBuffer, AudioProcessor, ProcessContext};
 use crabjuice_dsp::GainProcessor;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,38 @@ pub type SharedProcessor = Arc<Mutex<Box<dyn AudioProcessor + Send>>>;
 pub struct AudioStats {
     pub peak: f32,
     pub rms: f32,
+}
+
+#[derive(Debug)]
+struct TunerSampleBuffer {
+    samples: VecDeque<f32>,
+    capacity: usize,
+}
+
+impl TunerSampleBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push_interleaved(&mut self, input: &[f32], channels: usize) {
+        if channels == 0 || self.capacity == 0 {
+            return;
+        }
+        for frame in input.chunks_exact(channels) {
+            let mono = frame.iter().sum::<f32>() / channels as f32;
+            if self.samples.len() == self.capacity {
+                self.samples.pop_front();
+            }
+            self.samples.push_back(mono);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<f32> {
+        self.samples.iter().copied().collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +69,45 @@ pub struct LiveAudioSession {
     pub output_config: SupportedStreamConfig,
     input_stats: Arc<Mutex<AudioStats>>,
     output_stats: Arc<Mutex<AudioStats>>,
+}
+
+pub struct TunerSession {
+    input_stream: Stream,
+    pub input_name: String,
+    pub input_config: SupportedStreamConfig,
+    input_stats: Arc<Mutex<AudioStats>>,
+    samples: Arc<Mutex<TunerSampleBuffer>>,
+}
+
+impl TunerSession {
+    pub fn play(&self) -> Result<()> {
+        self.input_stream
+            .play()
+            .context("failed to start tuner input stream")
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        self.input_stream
+            .pause()
+            .context("failed to pause tuner input stream")
+    }
+
+    pub fn input_stats(&self) -> AudioStats {
+        current_stats(&self.input_stats)
+    }
+
+    pub fn samples(&self) -> Vec<f32> {
+        self.samples
+            .lock()
+            .map(|samples| samples.snapshot())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for TunerSession {
+    fn drop(&mut self) {
+        let _ = self.input_stream.pause();
+    }
 }
 
 impl LiveAudioSession {
@@ -162,6 +234,32 @@ pub fn start_live_audio(
         output_config,
         input_stats,
         output_stats,
+    })
+}
+
+pub fn start_tuner_audio(input_device: Device) -> Result<TunerSession> {
+    let input_config = input_device
+        .default_input_config()
+        .context("selected input device has no default input config")?;
+    let channels = usize::from(input_config.channels());
+    let capacity = input_config.sample_rate().0 as usize * 2;
+    let samples = Arc::new(Mutex::new(TunerSampleBuffer::new(capacity)));
+    let input_stats = Arc::new(Mutex::new(AudioStats::default()));
+    let input_stream = build_tuner_input_stream(
+        &input_device,
+        &input_config.config(),
+        input_config.sample_format(),
+        Arc::clone(&samples),
+        Arc::clone(&input_stats),
+        channels,
+    )?;
+
+    Ok(TunerSession {
+        input_stream,
+        input_name: device_name(&input_device),
+        input_config,
+        input_stats,
+        samples,
     })
 }
 
@@ -420,6 +518,68 @@ fn build_input_stream(
     }
 }
 
+fn build_tuner_input_stream(
+    device: &Device,
+    config: &StreamConfig,
+    sample_format: CpalSampleFormat,
+    samples: Arc<Mutex<TunerSampleBuffer>>,
+    input_stats: Arc<Mutex<AudioStats>>,
+    channels: usize,
+) -> Result<Stream> {
+    let err_fn = |err| eprintln!("tuner input stream error: {err}");
+
+    match sample_format {
+        CpalSampleFormat::F32 => device
+            .build_input_stream(
+                config,
+                move |data: &[f32], _| {
+                    update_stats(&input_stats, data);
+                    write_tuner_input(data, channels, &samples);
+                },
+                err_fn,
+                None,
+            )
+            .context("failed to build f32 tuner input stream"),
+        CpalSampleFormat::I16 => device
+            .build_input_stream(
+                config,
+                move |data: &[i16], _| {
+                    let normalized = data
+                        .iter()
+                        .map(|sample| *sample as f32 / i16::MAX as f32)
+                        .collect::<Vec<_>>();
+                    update_stats(&input_stats, &normalized);
+                    write_tuner_input(&normalized, channels, &samples);
+                },
+                err_fn,
+                None,
+            )
+            .context("failed to build i16 tuner input stream"),
+        CpalSampleFormat::U16 => device
+            .build_input_stream(
+                config,
+                move |data: &[u16], _| {
+                    let normalized = data
+                        .iter()
+                        .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                        .collect::<Vec<_>>();
+                    update_stats(&input_stats, &normalized);
+                    write_tuner_input(&normalized, channels, &samples);
+                },
+                err_fn,
+                None,
+            )
+            .context("failed to build u16 tuner input stream"),
+        _ => bail!("unsupported tuner input sample format: {sample_format:?}"),
+    }
+}
+
+fn write_tuner_input(input: &[f32], channels: usize, samples: &Arc<Mutex<TunerSampleBuffer>>) {
+    if let Ok(mut samples) = samples.try_lock() {
+        samples.push_interleaved(input, channels);
+    }
+}
+
 fn write_input<I>(samples: I, producer: &Arc<Mutex<HeapProducer<f32>>>)
 where
     I: IntoIterator<Item = f32>,
@@ -623,5 +783,24 @@ mod tests {
 
         assert_eq!(stats.peak, 1.0);
         assert!((stats.rms - 0.612_372_46).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tuner_sample_buffer_downmixes_interleaved_channels() {
+        let mut buffer = TunerSampleBuffer::new(4);
+
+        buffer.push_interleaved(&[1.0, 0.0, 0.5, -0.5], 2);
+
+        assert_eq!(buffer.snapshot(), vec![0.5, 0.0]);
+    }
+
+    #[test]
+    fn tuner_sample_buffer_retains_only_the_latest_samples() {
+        let mut buffer = TunerSampleBuffer::new(3);
+
+        buffer.push_interleaved(&[1.0, 2.0], 1);
+        buffer.push_interleaved(&[3.0, 4.0], 1);
+
+        assert_eq!(buffer.snapshot(), vec![2.0, 3.0, 4.0]);
     }
 }

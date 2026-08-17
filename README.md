@@ -83,6 +83,12 @@ meters for input and output. Press `a` or click `+ Add effect` to choose an
 effect directly. Chain rows expose bypass, move, and delete controls; parameters
 use clickable sliders with captured drag and `Shift` for fine adjustment.
 
+Press `Shift+T` or click the header tabs to open the input-only tuner. It offers
+chromatic and standard-guitar modes, displays frequency and cents around A4 =
+440 Hz, and does not send the instrument signal to an output device. In the
+tuner view, press `m` to change mode, use the arrow keys to select an input,
+`Space` to pause or resume capture, and `r` to retry the input stream.
+
 ## Example
 
 ```rust
@@ -149,6 +155,8 @@ cargo run -p real_audio --bin live_tui
 - `DelayLine`: fixed-capacity circular delay line for `f32` samples.
 - `DelayProcessor`: feedback delay with delay time, feedback, and dry/wet mix.
 - `DistortionProcessor`: normalized soft-clipping distortion with drive and mix.
+- `PitchDetector`: monophonic YIN pitch detection with frequency, MIDI note,
+  cents, and confidence estimates.
 - `ProcessorChain`: sequential container for boxed `AudioProcessor`
   implementations.
 - `OnePoleLowPass`: simple one-pole low-pass filter with per-channel state.
